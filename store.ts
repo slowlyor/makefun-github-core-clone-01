@@ -214,8 +214,17 @@ export class Store {
 // Global (Relay) ids: base64 of `<Type>:<numeric id>`. Opaque, stable across reads, and never the
 // plain numeric id rendered as a string (the suite checks both properties).
 
+/** Memoized: a global id is a pure function of (type, number) and serializers call it for
+ *  the same ids on every read — the base64 round-trip is pure overhead after the first. */
+const globalIdCache = new Map<string, string>();
+
 export function globalId(type: string, numericId: number): string {
-  return Buffer.from(`${type}:${numericId}`, 'utf8').toString('base64');
+  const key = `${type}:${numericId}`;
+  const cached = globalIdCache.get(key);
+  if (cached !== undefined) return cached;
+  const id = Buffer.from(key, 'utf8').toString('base64');
+  globalIdCache.set(key, id);
+  return id;
 }
 
 export function parseGlobalId(id: string): { type: string; numericId: number } | null {

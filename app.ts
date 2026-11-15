@@ -4,7 +4,6 @@
 // carries an X-GitHub-Request-Id.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
 import { Store } from './store.ts';
 import { handleRest, sendError, type RestRequest } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
@@ -21,11 +20,23 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 function decodeSegment(segment: string): string {
+  // Most segments carry no escapes; decoding them anyway pays a full decodeURIComponent
+  // call (and its try/catch) on every request.
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
     return segment;
   }
+}
+
+/** Request ids only have to be non-empty (the protocol checks): a monotonic counter in
+ *  hex is unique per process and costs nothing next to randomBytes per request. */
+let requestSeq = 0;
+
+function nextRequestId(): string {
+  requestSeq += 1;
+  return `AF${process.pid.toString(16).toUpperCase()}${requestSeq.toString(16).toUpperCase().padStart(8, '0')}`;
 }
 
 function isAuthorized(req: IncomingMessage): boolean {
@@ -36,9 +47,13 @@ function isAuthorized(req: IncomingMessage): boolean {
 }
 
 async function route(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  res.setHeader('x-github-request-id', randomBytes(8).toString('hex').toUpperCase());
-  const url = new URL(req.url ?? '/', 'http://internal');
-  const path = url.pathname;
+  res.setHeader('x-github-request-id', nextRequestId());
+  // `new URL(...)` parses (and validates) far more than routing needs: split the raw target
+  // on '?' ourselves and build the query table only on the branches that read it.
+  const rawUrl = req.url ?? '/';
+  const queryIndex = rawUrl.indexOf('?');
+  const path = queryIndex === -1 ? rawUrl : rawUrl.slice(0, queryIndex);
+  const queryString = queryIndex === -1 ? '' : rawUrl.slice(queryIndex + 1);
   const method = req.method ?? 'GET';
 
   if (path === '/healthz') {
@@ -76,7 +91,7 @@ async function route(store: Store, req: IncomingMessage, res: ServerResponse): P
     const restReq: RestRequest = {
       method,
       segments,
-      query: url.searchParams,
+      query: new URLSearchParams(queryString),
       body,
       host: req.headers.host ?? 'localhost',
     };
@@ -92,7 +107,7 @@ async function route(store: Store, req: IncomingMessage, res: ServerResponse): P
     const repo = store.getRepo(owner, name);
     if (repo === null) return sendError(res, 404, 'Not Found');
     if (rest === 'info/refs' && method === 'GET') {
-      const service = url.searchParams.get('service') ?? '';
+      const service = new URLSearchParams(queryString).get('service') ?? '';
       const protocol = req.headers['git-protocol'] ?? '';
       handleInfoRefs(res, repo, service, protocol.includes('version=2'));
       return;

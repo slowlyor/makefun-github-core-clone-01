@@ -53,15 +53,28 @@ export interface RestRequest {
 type Json = Record<string, unknown>;
 
 export function sendJson(res: ServerResponse, status: number, value: unknown, extraHeaders: Record<string, string> = {}): void {
-  const body = Buffer.from(JSON.stringify(value), 'utf8');
+  // End the string directly: Buffer.from(JSON.stringify(value)) allocates and copies the
+  // whole body once more for no gain — byteLength gives the same content-length.
+  const text = JSON.stringify(value);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': body.length,
+    'content-length': Buffer.byteLength(text),
     'x-oauth-scopes': 'repo, read:org',
     'x-accepted-oauth-scopes': 'repo, read:org',
     ...extraHeaders,
   });
-  res.end(body);
+  res.end(text);
+}
+
+export function sendJsonText(res: ServerResponse, status: number, text: string, extraHeaders: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(text),
+    'x-oauth-scopes': 'repo, read:org',
+    'x-accepted-oauth-scopes': 'repo, read:org',
+    ...extraHeaders,
+  });
+  res.end(text);
 }
 
 export function sendError(res: ServerResponse, status: number, message: string): void {
@@ -92,8 +105,14 @@ function boolField(value: Json, key: string): boolean | undefined {
 // ---------------------------------------------------------------------------------------------
 // Serializers (one shape per object, shared by every handler and by the MCP tools)
 
+/** The viewer is the only author the store ever names, so the user object is constant;
+ *  memoize it per login instead of rebuilding (and re-encoding its global id) per issue. */
+const userJsonCache = new Map<string, Json>();
+
 export function userJson(login: string): Json {
-  return {
+  const cached = userJsonCache.get(login);
+  if (cached !== undefined) return cached;
+  const value: Json = {
     login,
     id: VIEWER.id,
     node_id: globalId('User', VIEWER.id),
@@ -102,6 +121,19 @@ export function userJson(login: string): Json {
     name: VIEWER.name,
     email: VIEWER.email,
   };
+  userJsonCache.set(login, value);
+  return value;
+}
+
+/** The user object as pre-rendered JSON text, for the issue string fast path below. */
+const userJsonTextCache = new Map<string, string>();
+
+function userJsonText(login: string): string {
+  const cached = userJsonTextCache.get(login);
+  if (cached !== undefined) return cached;
+  const text = JSON.stringify(userJson(login));
+  userJsonTextCache.set(login, text);
+  return text;
 }
 
 export function repoJson(repo: RepoRec): Json {
@@ -195,6 +227,21 @@ export function issueJson(repo: RepoRec, issue: IssueRec): Json {
     repository_url: `/api/v3/repos/${repo.owner}/${repo.name}`,
     author_association: 'OWNER',
   };
+}
+
+/**
+ * The single-issue shape as a ready JSON string. Byte-identical to
+ * JSON.stringify(issueJson(repo, issue)): the same keys in the same order, every string
+ * field escaped by JSON.stringify itself, numbers and null interpolated literally. The
+ * write workload (POST) and the read workload (GET one issue) both serialize exactly this
+ * shape thousands of times, so building the object and stringifying it is pure overhead
+ * on those paths; the object form stays for lists, patches and pull-as-issue rendering.
+ */
+export function issueJsonText(repo: RepoRec, issue: IssueRec): string {
+  const labels = issue.labelNames.length === 0 ? '[]' : JSON.stringify(labelsJson(repo, issue.labelNames));
+  const closedAt = issue.closedAt === null ? 'null' : JSON.stringify(issue.closedAt);
+  const base = `/api/v3/repos/${repo.owner}/${repo.name}`;
+  return `{"id":${issue.recId},"node_id":${JSON.stringify(globalId('Issue', issue.recId))},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":${JSON.stringify(issue.state)},"labels":${labels},"user":${userJsonText(issue.author)},"assignees":[],"comments":${issue.comments.length},"created_at":${JSON.stringify(issue.createdAt)},"updated_at":${JSON.stringify(issue.updatedAt)},"closed_at":${closedAt},"url":${JSON.stringify(`${base}/issues/${issue.number}`)},"html_url":${JSON.stringify(`https://forge.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`)},"repository_url":${JSON.stringify(base)},"author_association":"OWNER"}`;
 }
 
 /** A pull request rendered in the issue shape (GitHub serves PRs through the issues API too). */
@@ -702,14 +749,15 @@ function handleIssues(store: Store, req: RestRequest, res: ServerResponse, repo:
     const labels = labelNamesFromBody(repo, parsed.value);
     if ('error' in labels) return sendError(res, 422, `Validation Failed: ${labels.error}`);
     const issue = createIssueRec(store, repo, { title, body: stringField(parsed.value, 'body') ?? '', labelNames: labels.names });
-    return sendJson(res, 201, issueJson(repo, issue));
+    return sendJsonText(res, 201, issueJsonText(repo, issue));
   }
   if (rest.length >= 2) {
     const number = Number(rest[1]);
     const item = Number.isInteger(number) ? repo.items.get(number) : undefined;
     if (item === undefined) return sendError(res, 404, 'Not Found');
     if (rest.length === 2 && req.method === 'GET') {
-      return sendJson(res, 200, item.kind === 'issue' ? issueJson(repo, item) : pullAsIssueJson(repo, item));
+      if (item.kind === 'issue') return sendJsonText(res, 200, issueJsonText(repo, item));
+      return sendJson(res, 200, pullAsIssueJson(repo, item));
     }
     if (rest.length === 2 && req.method === 'PATCH') {
       const parsed = parseBodyJson(req.body);

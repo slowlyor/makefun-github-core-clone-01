@@ -447,13 +447,50 @@ export function buildPack(objects: readonly PackEntryObject[]): Buffer {
   return Buffer.concat([body, Buffer.from(sha1Hex(body), 'hex')]);
 }
 
+/** Adler-32 (the checksum a zlib stream carries as its last four bytes). */
+export function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  // Defer the mod: 5552 is the largest run whose sums cannot overflow a double.
+  for (let offset = 0; offset < data.length; offset += 5552) {
+    const end = Math.min(offset + 5552, data.length);
+    for (let i = offset; i < end; i += 1) {
+      a += data[i]!;
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 /**
  * Inflate one pack object starting at `offset`, learning exactly how many compressed bytes it
- * occupies. zlib ignores trailing bytes past a deflate stream's end, so "inflates to the
- * expected size" is a monotonic predicate in the slice length and a binary search finds the
- * exact end — synchronously, with no stream round-trips on the push hot path.
+ * occupies. zlib's inflate ignores trailing bytes, so one inflate of the whole remainder yields
+ * the data; the stream's own last four bytes are the adler32 of that data, so scanning for them
+ * finds the exact end — verified by re-inflating the candidate slice — with no binary search
+ * of throwing inflates (each failed probe used to pay a full Error with a captured stack).
  */
 function inflateExact(buffer: Buffer, offset: number, expectedSize: number): { data: Buffer; consumed: number } {
+  const data = inflateSync(buffer.subarray(offset));
+  if (data.length !== expectedSize) throw new Error('corrupt deflate stream in pack');
+  const tail = Buffer.alloc(4);
+  tail.writeUInt32BE(adler32(data), 0);
+  let searchFrom = offset;
+  for (;;) {
+    const idx = buffer.indexOf(tail, searchFrom);
+    if (idx === -1) break;
+    const consumed = idx + 4 - offset;
+    try {
+      const check = inflateSync(buffer.subarray(offset, offset + consumed));
+      if (check.length === expectedSize && check.equals(data)) return { data, consumed };
+    } catch {
+      // A spurious adler match inside the stream: its slice is truncated and cannot inflate.
+    }
+    searchFrom = idx + 1;
+  }
+  // Pathological fallback: the old binary search over slice lengths.
   const remaining = buffer.length - offset;
   let lo = 1;
   let hi = remaining;

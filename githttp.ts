@@ -81,10 +81,13 @@ function v2Advertisement(): Buffer {
   return Buffer.concat([...lines.map((line) => pktLine(`${line}\n`)), PKT_FLUSH]);
 }
 
+/** The v2 advertisement never changes; build it once instead of per info/refs call. */
+const V2_ADVERTISEMENT = v2Advertisement();
+
 export function handleInfoRefs(res: ServerResponse, repo: RepoRec, service: string, protocolV2: boolean): void {
   if (service === 'git-upload-pack') {
     if (protocolV2) {
-      sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', v2Advertisement());
+      sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
     } else {
       sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', v0Advertisement(repo, 'git-upload-pack'));
     }
@@ -146,18 +149,27 @@ interface FetchArgs extends FetchRequestShape {
   done: boolean;
 }
 
+/** The band-1 marker byte, shared: Buffer.concat never mutates its inputs. */
+const BAND_ONE = Buffer.from([1]);
+
+/**
+ * Frame a pack as sideband pkt-lines, as separate parts (header, band byte, slice) so the
+ * caller's single Buffer.concat is the only copy of the pack bytes — the old version built
+ * each packet with its own concat and the caller copied it again.
+ */
 function sidebandPackets(pack: Buffer): Buffer[] {
   const packets: Buffer[] = [];
   // A pkt-line's length field (header included) must stay <= 65520: 4 header bytes + 1 band
   // byte leaves 65515 bytes of pack per packet.
   const CHUNK = 65515;
   if (pack.length === 0) {
-    packets.push(pktLine(Buffer.concat([Buffer.from([1])])));
+    packets.push(Buffer.from('0005', 'ascii'), BAND_ONE);
     return packets;
   }
   for (let offset = 0; offset < pack.length; offset += CHUNK) {
     const slice = pack.subarray(offset, Math.min(offset + CHUNK, pack.length));
-    packets.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
+    const length = slice.length + 1 + 4;
+    packets.push(Buffer.from(length.toString(16).padStart(4, '0'), 'ascii'), BAND_ONE, slice);
   }
   return packets;
 }
@@ -288,6 +300,11 @@ function validatePush(repo: RepoRec, command: PushCommand): string | null {
   if (current !== oldOid) return 'stale info';
   if (ref.startsWith('refs/heads/')) {
     if (object.type !== 'commit') return 'not a commit';
+    // The common case is a linear push: the new commit's parent IS the old tip, so the
+    // fast-forward holds by construction and no ancestry walk is needed. Anything else
+    // (a merge, a branch point) falls back to the full walk, exactly as before.
+    const tip = getCommit(repo, newOid);
+    if (tip !== null && tip.parents.includes(oldOid)) return null;
     if (!isAncestor(repo, oldOid, newOid)) return 'non-fast-forward';
   }
   return null;
