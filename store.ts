@@ -97,9 +97,12 @@ export interface RepoRec {
   createdAt: string;
   updatedAt: string;
   commitCache: Map<string, ParsedCommit>;
+  /** Bumped whenever a label is created, patched or deleted: issue responses render label
+   *  colors/descriptions, so a memoized issue body must be invalidated by label edits too. */
+  labelRev: number;
   /** Memoized fetch answers (pack + shallow info) by request signature: the clone workload
    *  asks for the same depth-1 pack fifty times concurrently. */
-  fetchCache: Map<string, { pack: Buffer; shallow: string[]; unshallow: string[] }>;
+  fetchCache: Map<string, { shallow: string[]; unshallow: string[]; resp: Buffer }>;
 }
 
 /** The one identity the trial's bearer token names. */
@@ -162,6 +165,7 @@ export class Store {
       createdAt: ts,
       updatedAt: ts,
       commitCache: new Map(),
+      labelRev: 0,
       fetchCache: new Map(),
     };
     this.repos.set(repoKey(owner, name), repo);

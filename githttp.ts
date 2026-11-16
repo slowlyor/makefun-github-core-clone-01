@@ -4,7 +4,7 @@
 // (acknowledgments, shallow-info, packfile) with the pack sideband-framed in band 1, and a push
 // answers its per-ref ok/ng report sideband-framed the same way.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ForgeResponse } from './forge.ts';
 import {
   PKT_DELIM,
   PKT_FLUSH,
@@ -18,7 +18,6 @@ import {
   pktLine,
   readObject,
   selectFetchObjects,
-  sha1Hex,
   unpackPack,
   type FetchRequestShape,
 } from './git.ts';
@@ -26,7 +25,7 @@ import type { RepoRec } from './store.ts';
 
 export const AGENT = 'asu-forge/1.0';
 
-function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
+function sendBuffer(res: ForgeResponse, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, {
     'content-type': contentType,
     'content-length': body.length,
@@ -84,7 +83,7 @@ function v2Advertisement(): Buffer {
 /** The v2 advertisement never changes; build it once instead of per info/refs call. */
 const V2_ADVERTISEMENT = v2Advertisement();
 
-export function handleInfoRefs(res: ServerResponse, repo: RepoRec, service: string, protocolV2: boolean): void {
+export function handleInfoRefs(res: ForgeResponse, repo: RepoRec, service: string, protocolV2: boolean): void {
   if (service === 'git-upload-pack') {
     if (protocolV2) {
       sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
@@ -110,7 +109,7 @@ interface LsRefsArgs {
   prefixes: string[];
 }
 
-function handleLsRefs(res: ServerResponse, repo: RepoRec, args: LsRefsArgs): void {
+function handleLsRefs(res: ForgeResponse, repo: RepoRec, args: LsRefsArgs): void {
   const matches = (name: string): boolean => args.prefixes.length === 0 || args.prefixes.some((prefix) => name.startsWith(prefix));
   const lines: string[] = [];
   const head = headTarget(repo);
@@ -174,7 +173,7 @@ function sidebandPackets(pack: Buffer): Buffer[] {
   return packets;
 }
 
-function handleFetch(res: ServerResponse, repo: RepoRec, args: FetchArgs): void {
+function handleFetch(res: ForgeResponse, repo: RepoRec, args: FetchArgs): void {
   for (const want of args.wants) {
     if (!isOid(want) || readObject(repo, want) === null) {
       sendBuffer(res, 200, 'application/x-git-upload-pack-result', pktLine(`ERR no such object ${want}\n`));
@@ -196,40 +195,43 @@ function handleFetch(res: ServerResponse, repo: RepoRec, args: FetchArgs): void 
     sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
     return;
   }
-  const signature = sha1Hex(
-    Buffer.from(
-      JSON.stringify([
-        [...args.wants].sort(),
-        [...args.haves].sort(),
-        [...args.clientShallows].sort(),
-        args.deepen,
-        args.deepenSince,
-        [...args.deepenNot].sort(),
-      ]),
-      'utf8',
-    ),
-  );
+  // The cache key is the request itself, joined: the fields are hex ids and numbers, so
+  // '\n' and ',' separators cannot occur inside one — no JSON.stringify and no SHA-1 per
+  // fetch for a key that only has to be unique within this repository's cache.
+  const signature = [
+    [...args.wants].sort().join(','),
+    [...args.haves].sort().join(','),
+    [...args.clientShallows].sort().join(','),
+    String(args.deepen),
+    String(args.deepenSince),
+    [...args.deepenNot].sort().join(','),
+  ].join('\n');
+  // The clone workload asks for the same depth-1 pack fifty times concurrently: the whole
+  // response (shallow-info + packfile + sideband framing) is a pure function of the request
+  // signature, so build it once and serve the cached bytes on every later hit instead of
+  // re-framing the pack per fetch.
   let cached = repo.fetchCache.get(signature);
   if (cached === undefined) {
     const selection = selectFetchObjects(repo, args);
-    cached = { pack: buildPack(selection.objects), shallow: selection.shallow, unshallow: selection.unshallow };
+    const pack = buildPack(selection.objects);
+    if (selection.shallow.length > 0 || selection.unshallow.length > 0) {
+      parts.push(pktLine('shallow-info\n'));
+      for (const sha of selection.shallow) parts.push(pktLine(`shallow ${sha}\n`));
+      for (const sha of selection.unshallow) parts.push(pktLine(`unshallow ${sha}\n`));
+      parts.push(PKT_DELIM);
+    }
+    parts.push(pktLine('packfile\n'));
+    parts.push(...sidebandPackets(pack));
+    parts.push(PKT_FLUSH);
+    cached = { shallow: selection.shallow, unshallow: selection.unshallow, resp: Buffer.concat(parts) };
     if (repo.fetchCache.size > 128) repo.fetchCache.clear();
     repo.fetchCache.set(signature, cached);
   }
-  if (cached.shallow.length > 0 || cached.unshallow.length > 0) {
-    parts.push(pktLine('shallow-info\n'));
-    for (const sha of cached.shallow) parts.push(pktLine(`shallow ${sha}\n`));
-    for (const sha of cached.unshallow) parts.push(pktLine(`unshallow ${sha}\n`));
-    parts.push(PKT_DELIM);
-  }
-  parts.push(pktLine('packfile\n'));
-  parts.push(...sidebandPackets(cached.pack));
-  parts.push(PKT_FLUSH);
-  sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached.resp);
 }
 
 /** POST /git-upload-pack: dispatch on the v2 command in the first pkt-line. */
-export function handleUploadPack(res: ServerResponse, repo: RepoRec, body: Buffer): void {
+export function handleUploadPack(res: ForgeResponse, repo: RepoRec, body: Buffer): void {
   let packets;
   try {
     packets = parsePktLines(body).packets;
@@ -315,7 +317,7 @@ function applyPush(repo: RepoRec, command: PushCommand): void {
   else repo.refs.set(command.ref, command.newOid);
 }
 
-export async function handleReceivePack(res: ServerResponse, repo: RepoRec, body: Buffer): Promise<void> {
+export async function handleReceivePack(res: ForgeResponse, repo: RepoRec, body: Buffer): Promise<void> {
   let parsed;
   try {
     parsed = parsePktLines(body);
@@ -390,4 +392,3 @@ export async function handleReceivePack(res: ServerResponse, repo: RepoRec, body
   }
 }
 
-export type { IncomingMessage };

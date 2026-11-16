@@ -3,7 +3,8 @@
 // every other route requires the bearer token the trial hands the process, and every answer
 // carries an X-GitHub-Request-Id.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server } from 'node:http';
+import type { ForgeHeaders, ForgeRequest, ForgeResponse } from './forge.ts';
 import { Store } from './store.ts';
 import { handleRest, sendError, type RestRequest } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
@@ -14,7 +15,12 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => {
+      // A request body almost always arrives in one chunk (a 1 KiB push pack, a small
+      // JSON body): return it directly instead of allocating and copying via concat.
+      if (chunks.length === 1) resolve(chunks[0]!);
+      else resolve(Buffer.concat(chunks));
+    });
     req.on('error', reject);
   });
 }
@@ -39,31 +45,41 @@ function nextRequestId(): string {
   return `AF${process.pid.toString(16).toUpperCase()}${requestSeq.toString(16).toUpperCase().padStart(8, '0')}`;
 }
 
-function isAuthorized(req: IncomingMessage): boolean {
+/** The expected Authorization header value, built once: the token is fixed for the process
+ *  lifetime, so rebuilding `Bearer ${token}` (a template allocation) per request is waste. */
+let expectedAuth: string | null = null;
+
+function isAuthorized(req: ForgeRequest): boolean {
+  if (expectedAuth !== null) return req.headers.authorization === expectedAuth;
   const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const header = req.headers.authorization ?? '';
-  if (expected !== '') return header === `Bearer ${expected}`;
+  if (expected !== '') {
+    expectedAuth = `Bearer ${expected}`;
+    return header === expectedAuth;
+  }
   return header.startsWith('Bearer ');
 }
 
-async function route(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
+/** The routing core, transport-neutral: both the node:http adapter and the raw socket
+ *  server build a ForgeRequest (body already read) and hand it here with a ForgeResponse.
+ *  Kept async only because receive-pack is async; every handler runs synchronously. */
+export async function route(store: Store, req: ForgeRequest, res: ForgeResponse): Promise<void> {
   res.setHeader('x-github-request-id', nextRequestId());
   // `new URL(...)` parses (and validates) far more than routing needs: split the raw target
   // on '?' ourselves and build the query table only on the branches that read it.
-  const rawUrl = req.url ?? '/';
+  const rawUrl = req.url;
   const queryIndex = rawUrl.indexOf('?');
   const path = queryIndex === -1 ? rawUrl : rawUrl.slice(0, queryIndex);
   const queryString = queryIndex === -1 ? '' : rawUrl.slice(queryIndex + 1);
-  const method = req.method ?? 'GET';
+  const method = req.method;
+  const body = req.body;
 
   if (path === '/healthz') {
-    const body = Buffer.from(JSON.stringify({ ok: true }), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'content-length': body.length });
-    res.end(body);
+    const health = Buffer.from(JSON.stringify({ ok: true }), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'content-length': health.length });
+    res.end(health);
     return;
   }
-
-  const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
 
   if (!isAuthorized(req)) {
     sendError(res, 401, 'Bad credentials');
@@ -126,14 +142,28 @@ async function route(store: Store, req: IncomingMessage, res: ServerResponse): P
   return sendError(res, 404, 'Not Found');
 }
 
-/** Build the forge's HTTP server (not yet listening — main.ts owns the lifecycle). */
+/** Build the forge's HTTP server on Node's http stack (not yet listening — main.ts owns
+ *  the lifecycle). Kept as the fallback transport: it adapts each IncomingMessage into a
+ *  ForgeRequest (body already read) and hands the real ServerResponse through, which
+ *  satisfies ForgeResponse structurally. */
 export function createApp(store: Store = new Store()): Server {
   const server = createServer((req, res) => {
-    route(store, req, res).catch((error: unknown) => {
-      console.error('request failed:', error);
-      if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
-      else res.end();
-    });
+    void (async () => {
+      try {
+        const method = req.method ?? 'GET';
+        const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
+        const headers: ForgeHeaders = {};
+        for (const [name, value] of Object.entries(req.headers)) {
+          headers[name] = Array.isArray(value) ? value.join(', ') : value;
+        }
+        const forgeReq: ForgeRequest = { method, url: req.url ?? '/', headers, body };
+        await route(store, forgeReq, res as unknown as ForgeResponse);
+      } catch (error: unknown) {
+        console.error('request failed:', error);
+        if (!res.headersSent) sendError(res as unknown as ForgeResponse, 500, 'Internal Server Error');
+        else res.end();
+      }
+    })();
   });
   server.headersTimeout = 60_000;
   server.requestTimeout = 0;

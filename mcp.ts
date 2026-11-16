@@ -4,7 +4,7 @@
 // a repository or issue created here is the same object there, with the same ids. tools/list is
 // a fixed literal, so two calls answer byte-for-byte identical lists.
 
-import type { ServerResponse } from 'node:http';
+import type { ForgeResponse } from './forge.ts';
 import { addCommentRec, createIssueRec, createPullRec, listIssues, listPulls, VIEWER, type RepoRec, type Store } from './store.ts';
 import { branchTip, commentJson, issueJson, mergePullRequest, pullJson, repoJson, sendJson, type MergeMethod } from './rest.ts';
 
@@ -375,7 +375,7 @@ function handleMessage(store: Store, message: RpcMessage): Record<string, unknow
 }
 
 /** POST /mcp. A body that is not JSON is a 400 with a -32700 parse error, per the transport. */
-export function handleMcp(store: Store, body: Buffer, res: ServerResponse): void {
+export function handleMcp(store: Store, body: Buffer, res: ForgeResponse): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body.toString('utf8'));

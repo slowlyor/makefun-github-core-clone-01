@@ -4,7 +4,7 @@
 // `message`), unknown routes are 404 JSON, a malformed JSON body is 400, and a repository that
 // belongs to another login is 404, never 403.
 
-import type { ServerResponse } from 'node:http';
+import type { ForgeResponse } from './forge.ts';
 import {
   blobAtPath,
   buildCommitData,
@@ -52,32 +52,28 @@ export interface RestRequest {
 
 type Json = Record<string, unknown>;
 
-export function sendJson(res: ServerResponse, status: number, value: unknown, extraHeaders: Record<string, string> = {}): void {
-  // End the string directly: Buffer.from(JSON.stringify(value)) allocates and copies the
-  // whole body once more for no gain — byteLength gives the same content-length.
+export function sendJson(res: ForgeResponse, status: number, value: unknown, extraHeaders: Record<string, string> = {}): void {
+  // End a Buffer, not the string: res.end(string) re-encodes through writeUtf8String and
+  // the string chunk path, which measured ~80 us/request slower than ending the same bytes
+  // as a Buffer (and Buffer.byteLength scans the string again for the length). The Buffer
+  // is built once here; content-length is its exact byte length.
   const text = JSON.stringify(value);
+  sendJsonText(res, status, text, extraHeaders);
+}
+
+export function sendJsonText(res: ForgeResponse, status: number, text: string, extraHeaders: Record<string, string> = {}): void {
+  const body = Buffer.from(text, 'utf8');
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
+    'content-length': body.length,
     'x-oauth-scopes': 'repo, read:org',
     'x-accepted-oauth-scopes': 'repo, read:org',
     ...extraHeaders,
   });
-  res.end(text);
+  res.end(body);
 }
 
-export function sendJsonText(res: ServerResponse, status: number, text: string, extraHeaders: Record<string, string> = {}): void {
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
-    'x-oauth-scopes': 'repo, read:org',
-    'x-accepted-oauth-scopes': 'repo, read:org',
-    ...extraHeaders,
-  });
-  res.end(text);
-}
-
-export function sendError(res: ServerResponse, status: number, message: string): void {
+export function sendError(res: ForgeResponse, status: number, message: string): void {
   sendJson(res, status, { message, documentation_url: 'https://docs.github.com/rest' });
 }
 
@@ -244,6 +240,57 @@ export function issueJsonText(repo: RepoRec, issue: IssueRec): string {
   return `{"id":${issue.recId},"node_id":${JSON.stringify(globalId('Issue', issue.recId))},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":${JSON.stringify(issue.state)},"labels":${labels},"user":${userJsonText(issue.author)},"assignees":[],"comments":${issue.comments.length},"created_at":${JSON.stringify(issue.createdAt)},"updated_at":${JSON.stringify(issue.updatedAt)},"closed_at":${closedAt},"url":${JSON.stringify(`${base}/issues/${issue.number}`)},"html_url":${JSON.stringify(`https://forge.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`)},"repository_url":${JSON.stringify(base)},"author_association":"OWNER"}`;
 }
 
+/** The fingerprint of every input issueJsonText reads. Any mutation of the issue, its labels
+ *  or its repository changes at least one field here, so a cache entry whose fingerprint
+ *  still matches renders byte-identical JSON. */
+function issueSnap(repo: RepoRec, issue: IssueRec): string {
+  return JSON.stringify([
+    repo.owner,
+    repo.name,
+    issue.recId,
+    issue.number,
+    issue.title,
+    issue.body,
+    issue.state,
+    issue.author,
+    issue.labelNames,
+    repo.labelRev,
+    issue.comments.length,
+    issue.createdAt,
+    issue.updatedAt,
+    issue.closedAt,
+  ]);
+}
+
+/** Memoized single-issue response bodies, keyed by the issue's global record id. The read
+ *  workload GETs one issue 2,000 times in a row; its bytes never change between reads, so
+ *  rebuilding the string and re-encoding it per request is pure overhead. The snapshot
+ *  check (one small JSON.stringify) is the only per-read work, and any mutation path that
+ *  changes a rendered field changes the snapshot, so a stale body can never be served. */
+const issueRespCache = new Map<number, { snap: string; buf: Buffer }>();
+
+export function issueResponseBuffer(repo: RepoRec, issue: IssueRec): Buffer {
+  const snap = issueSnap(repo, issue);
+  const cached = issueRespCache.get(issue.recId);
+  if (cached !== undefined && cached.snap === snap) return cached.buf;
+  const buf = Buffer.from(issueJsonText(repo, issue), 'utf8');
+  if (issueRespCache.size > 4096) issueRespCache.clear();
+  issueRespCache.set(issue.recId, { snap, buf });
+  return buf;
+}
+
+/** Send a single issue with the memoized body (same headers as sendJsonText). */
+function sendIssue(res: ForgeResponse, status: number, repo: RepoRec, issue: IssueRec): void {
+  const body = issueResponseBuffer(repo, issue);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': body.length,
+    'x-oauth-scopes': 'repo, read:org',
+    'x-accepted-oauth-scopes': 'repo, read:org',
+  });
+  res.end(body);
+}
+
 /** A pull request rendered in the issue shape (GitHub serves PRs through the issues API too). */
 export function pullAsIssueJson(repo: RepoRec, pull: PullRec): Json {
   const base = issueJson(repo, {
@@ -365,7 +412,7 @@ function paginate<T>(req: RestRequest, path: string, all: T[]): Page<T> {
   return { items, link: links.length > 0 ? links.join(', ') : null };
 }
 
-function sendList<T>(res: ServerResponse, req: RestRequest, path: string, all: T[], map: (item: T) => Json): void {
+function sendList<T>(res: ForgeResponse, req: RestRequest, path: string, all: T[], map: (item: T) => Json): void {
   const page = paginate(req, path, all);
   const headers: Record<string, string> = {};
   if (page.link !== null) headers.link = page.link;
@@ -375,7 +422,7 @@ function sendList<T>(res: ServerResponse, req: RestRequest, path: string, all: T
 // ---------------------------------------------------------------------------------------------
 // Repositories and the viewer
 
-function handleCreateRepo(store: Store, req: RestRequest, res: ServerResponse): void {
+function handleCreateRepo(store: Store, req: RestRequest, res: ForgeResponse): void {
   const parsed = parseBodyJson(req.body);
   if (!parsed.ok) return sendError(res, 400, 'Problems parsing JSON');
   const name = stringField(parsed.value, 'name');
@@ -392,7 +439,7 @@ function handleCreateRepo(store: Store, req: RestRequest, res: ServerResponse): 
   return sendJson(res, 201, repoJson(repo));
 }
 
-function handleRepoItem(store: Store, req: RestRequest, res: ServerResponse, repo: RepoRec): void {
+function handleRepoItem(store: Store, req: RestRequest, res: ForgeResponse, repo: RepoRec): void {
   if (req.method === 'GET') return sendJson(res, 200, repoJson(repo));
   if (req.method === 'DELETE') {
     store.deleteRepo(repo.owner, repo.name);
@@ -424,7 +471,7 @@ function handleRepoItem(store: Store, req: RestRequest, res: ServerResponse, rep
 // ---------------------------------------------------------------------------------------------
 // Branches, commits, git refs
 
-function handleBranches(req: RestRequest, res: ServerResponse, repo: RepoRec, rest: string[]): void {
+function handleBranches(req: RestRequest, res: ForgeResponse, repo: RepoRec, rest: string[]): void {
   if (rest.length === 1 && req.method === 'GET') {
     const branches: Json[] = [];
     for (const [ref, sha] of repo.refs) {
@@ -460,7 +507,7 @@ export function resolveRefToCommit(repo: RepoRec, ref: string | undefined): stri
   return null;
 }
 
-function handleCommits(req: RestRequest, res: ServerResponse, repo: RepoRec, rest: string[]): void {
+function handleCommits(req: RestRequest, res: ForgeResponse, repo: RepoRec, rest: string[]): void {
   if (rest.length === 1 && req.method === 'GET') {
     const shaParam = req.query.get('sha') ?? undefined;
     const tip = resolveRefToCommit(repo, shaParam);
@@ -483,7 +530,7 @@ function handleCommits(req: RestRequest, res: ServerResponse, repo: RepoRec, res
   return sendError(res, 404, 'Not Found');
 }
 
-function handleGitRefs(store: Store, req: RestRequest, res: ServerResponse, repo: RepoRec, rest: string[]): void {
+function handleGitRefs(store: Store, req: RestRequest, res: ForgeResponse, repo: RepoRec, rest: string[]): void {
   void store;
   // rest: ['git', 'refs', ...refParts]
   if (rest.length === 2 && req.method === 'GET') {
@@ -548,7 +595,7 @@ function contentsBranchTip(repo: RepoRec, branch: string): { tip: string | null;
   return { tip: null, exists: false };
 }
 
-function handleContents(req: RestRequest, res: ServerResponse, repo: RepoRec, rest: string[]): void {
+function handleContents(req: RestRequest, res: ForgeResponse, repo: RepoRec, rest: string[]): void {
   const path = rest.slice(1).join('/');
   if (req.method === 'GET') {
     const commitSha = resolveRefToCommit(repo, req.query.get('ref') ?? undefined);
@@ -663,7 +710,7 @@ function contentEntryJson(repo: RepoRec, entry: { mode: string; name: string; sh
 // ---------------------------------------------------------------------------------------------
 // Labels
 
-function handleLabels(store: Store, req: RestRequest, res: ServerResponse, repo: RepoRec, rest: string[]): void {
+function handleLabels(store: Store, req: RestRequest, res: ForgeResponse, repo: RepoRec, rest: string[]): void {
   if (rest.length === 1 && req.method === 'GET') {
     return sendJson(res, 200, [...repo.labels.values()].map(labelJson));
   }
@@ -676,6 +723,7 @@ function handleLabels(store: Store, req: RestRequest, res: ServerResponse, repo:
     const color = (stringField(parsed.value, 'color') ?? 'ededed').replace(/^#/, '');
     const label: LabelRec = { id: store.nextLabelId(), name, color, description: stringField(parsed.value, 'description') ?? '' };
     repo.labels.set(name, label);
+    repo.labelRev += 1;
     return sendJson(res, 201, labelJson(label));
   }
   if (rest.length === 2) {
@@ -687,6 +735,7 @@ function handleLabels(store: Store, req: RestRequest, res: ServerResponse, repo:
     if (req.method === 'DELETE') {
       if (label === undefined) return sendError(res, 404, 'Label not found');
       repo.labels.delete(rest[1]!);
+      repo.labelRev += 1;
       res.writeHead(204, { 'x-oauth-scopes': 'repo, read:org' });
       res.end();
       return;
@@ -698,6 +747,7 @@ function handleLabels(store: Store, req: RestRequest, res: ServerResponse, repo:
       if (color !== undefined) label.color = color.replace(/^#/, '');
       const description = stringField(parsed.value, 'description');
       if (description !== undefined) label.description = description;
+      repo.labelRev += 1;
       return sendJson(res, 200, labelJson(label));
     }
   }
@@ -728,7 +778,7 @@ function sortItems<T extends { seq: number }>(items: T[], req: RestRequest): T[]
   return sorted;
 }
 
-function handleIssues(store: Store, req: RestRequest, res: ServerResponse, repo: RepoRec, rest: string[]): void {
+function handleIssues(store: Store, req: RestRequest, res: ForgeResponse, repo: RepoRec, rest: string[]): void {
   if (rest.length === 1 && req.method === 'GET') {
     const state = req.query.get('state') ?? 'open';
     let issues = listIssues(repo);
@@ -749,6 +799,8 @@ function handleIssues(store: Store, req: RestRequest, res: ServerResponse, repo:
     const labels = labelNamesFromBody(repo, parsed.value);
     if ('error' in labels) return sendError(res, 422, `Validation Failed: ${labels.error}`);
     const issue = createIssueRec(store, repo, { title, body: stringField(parsed.value, 'body') ?? '', labelNames: labels.names });
+    // Fresh response: the snapshot + cache bookkeeping would cost more than it saves here
+    // (this issue has no cache entry yet); the first GET populates the cache instead.
     return sendJsonText(res, 201, issueJsonText(repo, issue));
   }
   if (rest.length >= 2) {
@@ -756,7 +808,7 @@ function handleIssues(store: Store, req: RestRequest, res: ServerResponse, repo:
     const item = Number.isInteger(number) ? repo.items.get(number) : undefined;
     if (item === undefined) return sendError(res, 404, 'Not Found');
     if (rest.length === 2 && req.method === 'GET') {
-      if (item.kind === 'issue') return sendJsonText(res, 200, issueJsonText(repo, item));
+      if (item.kind === 'issue') return sendIssue(res, 200, repo, item);
       return sendJson(res, 200, pullAsIssueJson(repo, item));
     }
     if (rest.length === 2 && req.method === 'PATCH') {
@@ -860,7 +912,7 @@ export function mergePullRequest(repo: RepoRec, pull: PullRec, method: MergeMeth
   return { ok: true, sha };
 }
 
-function handlePulls(store: Store, req: RestRequest, res: ServerResponse, repo: RepoRec, rest: string[]): void {
+function handlePulls(store: Store, req: RestRequest, res: ForgeResponse, repo: RepoRec, rest: string[]): void {
   if (rest.length === 1 && req.method === 'GET') {
     const state = req.query.get('state') ?? 'open';
     let pulls = listPulls(repo);
@@ -931,7 +983,7 @@ function handlePulls(store: Store, req: RestRequest, res: ServerResponse, repo: 
 // ---------------------------------------------------------------------------------------------
 // The router
 
-export function handleRest(store: Store, req: RestRequest, res: ServerResponse): void {
+export function handleRest(store: Store, req: RestRequest, res: ForgeResponse): void {
   const segments = req.segments;
   if (segments.length === 0) {
     if (req.method === 'GET') {

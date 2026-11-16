@@ -5,7 +5,7 @@
 // body). An unknown field is a 200 with an `errors` array naming the field, never an HTTP 400;
 // an unknown repository is data.repository = null with no errors.
 
-import type { ServerResponse } from 'node:http';
+import type { ForgeResponse } from './forge.ts';
 import { globalId, parseGlobalId, type ItemRec, type PullRec, type RepoRec, type Store } from './store.ts';
 import { mergePullRequest, pullFiles, pullMergeable, sendError, sendJson, type MergeMethod } from './rest.ts';
 import { addCommentRec, createIssueRec, createPullRec, listIssues, listPulls, nowIso, VIEWER } from './store.ts';
@@ -1209,7 +1209,7 @@ function runOperation(store: Store, body: Record<string, unknown>): Record<strin
 }
 
 /** POST /api/graphql — one operation, or a JSON array of them (GitHub's operation batching). */
-export function handleGraphQL(store: Store, body: Buffer, res: ServerResponse): void {
+export function handleGraphQL(store: Store, body: Buffer, res: ForgeResponse): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body.toString('utf8'));

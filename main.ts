@@ -3,7 +3,7 @@
 // {"done": true}, then exit 0. Without MAKEFUN_ENV_URL the same server simply listens on
 // $PORT (default 8080) and stays up, which is how the entry is run and tested locally.
 
-import { createApp } from './app.ts';
+import { createRawServer } from './rawserver.ts';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -41,7 +41,11 @@ async function waitForDone(envUrl: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const server = createApp();
+  // The raw socket server (rawserver.ts) drives the same route() as the node:http adapter
+  // (createApp) at a fraction of the per-request cost; the adapter stays as the fallback
+  // transport. Set FORGE_TRANSPORT=http to run on node:http instead.
+  const server =
+    process.env.FORGE_TRANSPORT === 'http' ? (await import('./app.ts')).createApp() : createRawServer();
   const envUrl = process.env.MAKEFUN_ENV_URL;
   if (envUrl !== undefined && envUrl !== '') {
     await new Promise<void>((resolve) => {

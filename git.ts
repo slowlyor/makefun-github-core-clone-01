@@ -71,8 +71,10 @@ export function parsePktLines(buffer: Buffer, offset = 0): { packets: PktPacket[
 // Objects
 
 export function hashObject(type: GitObjectType, data: Buffer): string {
+  // Feed the header and the payload as two updates: the old Buffer.concat copied the whole
+  // object (a 1 KiB blob on every push, three objects a pack) for no reason.
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
 export function writeObject(repo: RepoRec, type: GitObjectType, data: Buffer): string {
@@ -467,12 +469,29 @@ export function adler32(data: Buffer): number {
 
 /**
  * Inflate one pack object starting at `offset`, learning exactly how many compressed bytes it
- * occupies. zlib's inflate ignores trailing bytes, so one inflate of the whole remainder yields
- * the data; the stream's own last four bytes are the adler32 of that data, so scanning for them
- * finds the exact end — verified by re-inflating the candidate slice — with no binary search
- * of throwing inflates (each failed probe used to pay a full Error with a captured stack).
+ * occupies. Fast path: one `inflateSync` with `info: true` — the returned engine's bytesWritten
+ * is exactly the compressed bytes the stream consumed, so the object is inflated once and the
+ * boundary is known without rescanning for the adler tail or re-inflating a candidate slice.
+ * Anything unexpected about that result (an engine without a usable bytesWritten, a short
+ * inflate, a consumed length outside the pack) falls back to the adler-scan below, which
+ * re-verifies a candidate slice by re-inflating it — the behaviour the old code had on its
+ * own. A truncated or corrupt stream throws on either path, exactly as before.
  */
 function inflateExact(buffer: Buffer, offset: number, expectedSize: number): { data: Buffer; consumed: number } {
+  try {
+    const result = inflateSync(buffer.subarray(offset), { info: true }) as unknown;
+    if (typeof result === 'object' && result !== null && 'engine' in result && 'buffer' in result) {
+      const data = (result as { buffer: Buffer }).buffer;
+      const bytesWritten = (result as { engine: { bytesWritten?: unknown } }).engine?.bytesWritten;
+      if (Buffer.isBuffer(data) && data.length === expectedSize && typeof bytesWritten === 'number' &&
+          Number.isInteger(bytesWritten) && bytesWritten > 0 && offset + bytesWritten <= buffer.length) {
+        return { data, consumed: bytesWritten };
+      }
+    }
+  } catch {
+    // The info path is unavailable or the stream is corrupt here; the adler scan below
+    // throws the same corruption error for a genuinely bad stream.
+  }
   const data = inflateSync(buffer.subarray(offset));
   if (data.length !== expectedSize) throw new Error('corrupt deflate stream in pack');
   const tail = Buffer.alloc(4);
