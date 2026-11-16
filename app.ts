@@ -36,6 +36,28 @@ function decodeSegment(segment: string): string {
   }
 }
 
+/** Split a /api/v3 suffix into its segments without the split/filter/map chain: one
+ *  index scan, one array, and a decode only for segments that actually carry escapes.
+ *  Byte-identical results to the old `.split('/').filter(s => s !== '').map(decodeSegment)`. */
+function splitRestSegments(rest: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  for (let i = 0; i <= rest.length; i++) {
+    if (i === rest.length || rest[i] === '/') {
+      if (i > start) {
+        const segment = rest.slice(start, i);
+        out.push(segment.includes('%') ? decodeSegment(segment) : segment);
+      }
+      start = i + 1;
+    }
+  }
+  return out;
+}
+
+/** The empty query table, shared: handlers only ever call .get() on it, so one instance
+ *  serves every query-less request instead of allocating a URLSearchParams per request. */
+const EMPTY_QUERY = new URLSearchParams();
+
 /** Request ids only have to be non-empty (the protocol checks): a monotonic counter in
  *  hex is unique per process and costs nothing next to randomBytes per request. */
 let requestSeq = 0;
@@ -62,8 +84,10 @@ function isAuthorized(req: ForgeRequest): boolean {
 
 /** The routing core, transport-neutral: both the node:http adapter and the raw socket
  *  server build a ForgeRequest (body already read) and hand it here with a ForgeResponse.
- *  Kept async only because receive-pack is async; every handler runs synchronously. */
-export async function route(store: Store, req: ForgeRequest, res: ForgeResponse): Promise<void> {
+ *  Synchronous for every handler except receive-pack, which returns its promise so the
+ *  caller can await only that branch — the sequential workloads pay no microtask hop
+ *  per request. */
+export function route(store: Store, req: ForgeRequest, res: ForgeResponse): void | Promise<void> {
   res.setHeader('x-github-request-id', nextRequestId());
   // `new URL(...)` parses (and validates) far more than routing needs: split the raw target
   // on '?' ourselves and build the query table only on the branches that read it.
@@ -99,15 +123,10 @@ export async function route(store: Store, req: ForgeRequest, res: ForgeResponse)
   }
 
   if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-    const segments = path
-      .slice('/api/v3'.length)
-      .split('/')
-      .filter((segment) => segment !== '')
-      .map(decodeSegment);
     const restReq: RestRequest = {
       method,
-      segments,
-      query: new URLSearchParams(queryString),
+      segments: splitRestSegments(path.slice('/api/v3'.length)),
+      query: queryString === '' ? EMPTY_QUERY : new URLSearchParams(queryString),
       body,
       host: req.headers.host ?? 'localhost',
     };
@@ -133,8 +152,7 @@ export async function route(store: Store, req: ForgeRequest, res: ForgeResponse)
       return;
     }
     if (rest === 'git-receive-pack' && method === 'POST') {
-      await handleReceivePack(res, repo, body);
-      return;
+      return handleReceivePack(res, repo, body);
     }
     return sendError(res, 404, 'Not Found');
   }

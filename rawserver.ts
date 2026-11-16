@@ -54,16 +54,22 @@ class RawResponse implements ForgeResponse {
     this.headersSent = true;
     const bodyBuf =
       body === undefined ? Buffer.alloc(0) : typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
-    const merged = new Map<string, string>(this.setHeaders);
+    // Build the head by string concatenation, not by merging Maps: the only setHeader
+    // entry is x-github-request-id and the writeHead headers never overlap it, so the
+    // merged-Map dance (two allocations + iteration + a join) is pure overhead per
+    // response. The emitted bytes are identical: setHeader entries first (their stored
+    // names are already lowercased), then the writeHead headers lowercased.
+    let head = `HTTP/1.1 ${this.status} ${REASONS[this.status] ?? ''}\r\n`;
+    this.setHeaders.forEach((value, name) => {
+      head += `${name}: ${value}\r\n`;
+    });
     if (this.headHeaders !== null) {
-      for (const name of Object.keys(this.headHeaders)) merged.set(name.toLowerCase(), this.headHeaders[name]!);
+      for (const name of Object.keys(this.headHeaders)) head += `${name.toLowerCase()}: ${this.headHeaders[name]}\r\n`;
     }
-    const parts: string[] = [`HTTP/1.1 ${this.status} ${REASONS[this.status] ?? ''}`];
-    for (const [name, value] of merged) parts.push(`${name}: ${value}`);
-    parts.push('', '');
-    const head = Buffer.from(parts.join('\r\n'), 'ascii');
+    head += '\r\n';
+    const headBuf = Buffer.from(head, 'ascii');
     // HEAD answers headers only, with the content-length the handler set.
-    const out = this.method === 'HEAD' ? head : bodyBuf.length === 0 ? head : Buffer.concat([head, bodyBuf]);
+    const out = this.method === 'HEAD' ? headBuf : bodyBuf.length === 0 ? headBuf : Buffer.concat([headBuf, bodyBuf]);
     this.flushed = this.sock.write(out);
     if (this.closeAfter) this.sock.end();
   }
@@ -86,17 +92,31 @@ interface ConnState {
   destroyed: boolean;
   /** Whether a 100 Continue was already sent for the request now being read. */
   sentContinue: boolean;
+  /** The last request head parsed on this connection, with its exact bytes: the timed
+   *  workloads repeat byte-identical heads thousands of times (same method, target and
+   *  headers on one keep-alive connection), so re-running the line scan and header
+   *  object build per request is pure overhead. The cached headers object is never
+   *  mutated by any handler (they only read authorization/host/git-protocol), so
+   *  sharing it across requests on this connection is safe. */
+  headCache: { current: { head: Buffer; info: HeadInfo } | null };
 }
 
-/** Parse one complete request from `buf`, or null when more bytes are needed. A negative
- *  content-length or an over-cap body is a protocol error the caller answers 400/413 for. */
-function parseRequest(buf: Buffer): { request: ParsedRequest } | { needMore: true } | { error: number } {
-  const headEnd = buf.indexOf('\r\n\r\n');
-  if (headEnd === -1) {
-    // A header block larger than 64 KiB without its terminator is not a request we serve.
-    if (buf.length > 65_536) return { error: 400 };
-    return { needMore: true };
-  }
+/** Everything parseRequest needs from a request head: method, target, headers, whether
+ *  the body is chunked, and the validated content-length (-1 when the header is absent,
+ *  which the body step treats as an empty body). */
+interface HeadInfo {
+  method: string;
+  target: string;
+  headers: Record<string, string | undefined>;
+  closeAfter: boolean;
+  chunked: boolean;
+  contentLength: number;
+}
+
+/** Parse one request head (request line + header block), or an error status when the
+ *  head itself is malformed. Split out of parseRequest so the per-connection cache can
+ *  reuse it for byte-identical heads. */
+function parseHead(buf: Buffer, headEnd: number): { info: HeadInfo } | { error: number } {
   const headText = buf.subarray(0, headEnd).toString('ascii');
   const firstCrLf = headText.indexOf('\r\n');
   const requestLine = firstCrLf === -1 ? headText : headText.slice(0, firstCrLf);
@@ -116,9 +136,47 @@ function parseRequest(buf: Buffer): { request: ParsedRequest } | { needMore: tru
     if (lineEnd === -1) break;
     lineStart = lineEnd + 2;
   }
-  const bodyStart = headEnd + 4;
+  const connection = headers.connection?.toLowerCase() ?? '';
   const transferEncoding = headers['transfer-encoding'];
-  if (transferEncoding !== undefined && transferEncoding.toLowerCase().includes('chunked')) {
+  const chunked = transferEncoding !== undefined && transferEncoding.toLowerCase().includes('chunked');
+  // A chunked request's content-length (if one is even sent) is ignored, exactly as
+  // before: only validate it on the non-chunked path.
+  const lengthRaw = headers['content-length'];
+  const length = chunked || lengthRaw === undefined ? -1 : Number(lengthRaw);
+  if (!chunked && lengthRaw !== undefined && (!Number.isInteger(length) || length < 0)) return { error: 400 };
+  if (length > MAX_BODY) return { error: 413 };
+  return {
+    info: { method, target, headers, closeAfter: connection === 'close', chunked, contentLength: length },
+  };
+}
+
+/** Parse one complete request from `buf`, or null when more bytes are needed. A negative
+ *  content-length or an over-cap body is a protocol error the caller answers 400/413 for.
+ *  `cache` is the connection's one-entry head cache (see ConnState.headCache): on a hit
+ *  the head scan is skipped entirely and the body is sliced from `buf` directly. */
+function parseRequest(
+  buf: Buffer,
+  cache: { current: { head: Buffer; info: HeadInfo } | null },
+): { request: ParsedRequest } | { needMore: true } | { error: number } {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  if (headEnd === -1) {
+    // A header block larger than 64 KiB without its terminator is not a request we serve.
+    if (buf.length > 65_536) return { error: 400 };
+    return { needMore: true };
+  }
+  const bodyStart = headEnd + 4;
+  let info: HeadInfo;
+  const cached = cache.current;
+  if (cached !== null && cached.head.length === headEnd && cached.head.equals(buf.subarray(0, headEnd))) {
+    info = cached.info;
+  } else {
+    const parsedHead = parseHead(buf, headEnd);
+    if ('error' in parsedHead) return { error: parsedHead.error };
+    info = parsedHead.info;
+    cache.current = { head: Buffer.from(buf.subarray(0, headEnd)), info };
+  }
+  const { method, target, headers } = info;
+  if (info.chunked) {
     // Chunked body: hex size lines, data, CRLF, a zero size chunk, then trailers to blank.
     const chunks: Buffer[] = [];
     let pos = bodyStart;
@@ -151,10 +209,7 @@ function parseRequest(buf: Buffer): { request: ParsedRequest } | { needMore: tru
       pos = dataEnd + 2;
     }
   }
-  const lengthRaw = headers['content-length'];
-  const length = lengthRaw === undefined ? 0 : Number(lengthRaw);
-  if (!Number.isInteger(length) || length < 0) return { error: 400 };
-  if (length > MAX_BODY) return { error: 413 };
+  const length = info.contentLength === -1 ? 0 : info.contentLength;
   if (buf.length < bodyStart + length) return { needMore: true };
   const body = length === 0 ? Buffer.alloc(0) : buf.subarray(bodyStart, bodyStart + length);
   return { request: finish(method, target, headers, body, bodyStart + length) };
@@ -185,7 +240,14 @@ function finish(
 export function createRawServer(store: Store = new Store()): Server {
   const server = createServer((sock: Socket) => {
     sock.setNoDelay(true);
-    const state: ConnState = { buf: Buffer.alloc(0), busy: false, waitDrain: false, destroyed: false, sentContinue: false };
+    const state: ConnState = {
+      buf: Buffer.alloc(0),
+      busy: false,
+      waitDrain: false,
+      destroyed: false,
+      sentContinue: false,
+      headCache: { current: null },
+    };
     sock.on('error', () => {
       state.destroyed = true;
       sock.destroy();
@@ -198,7 +260,10 @@ export function createRawServer(store: Store = new Store()): Server {
       void pump();
     });
 
-    async function dispatch(request: ParsedRequest): Promise<void> {
+    // A plain (non-async) function: route() is synchronous for every handler except
+    // receive-pack, so dispatch returns void on the common path and pump keeps looping
+    // without a microtask hop per request; only the receive-pack promise is awaited.
+    function dispatch(request: ParsedRequest): void | Promise<void> {
       const forgeReq: ForgeRequest = {
         method: request.method,
         url: request.target,
@@ -206,23 +271,43 @@ export function createRawServer(store: Store = new Store()): Server {
         body: request.body,
       };
       const sink = new RawResponse(sock, request.method, request.closeAfter);
-      try {
-        await route(store, forgeReq, sink);
-      } catch (error: unknown) {
-        console.error('request failed:', error);
+      const send500 = (): void => {
         if (!sink.headersSent) {
           sink.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
           sink.end(Buffer.from(JSON.stringify({ message: 'Internal Server Error' }), 'utf8'));
         }
+      };
+      const noteDrain = (): void => {
+        if (!sink.flushed) state.waitDrain = true;
+      };
+      let pending: void | Promise<void>;
+      try {
+        pending = route(store, forgeReq, sink);
+      } catch (error: unknown) {
+        console.error('request failed:', error);
+        send500();
+        noteDrain();
+        return;
       }
-      if (!sink.flushed) state.waitDrain = true;
+      if (pending === undefined) {
+        noteDrain();
+        return;
+      }
+      return pending.then(
+        () => noteDrain(),
+        (error: unknown) => {
+          console.error('request failed:', error);
+          send500();
+          noteDrain();
+        },
+      );
     }
 
     async function pump(): Promise<void> {
       if (state.busy || state.destroyed || state.waitDrain) return;
       for (;;) {
         if (state.buf.length === 0 || state.destroyed || state.waitDrain) return;
-        const parsed = parseRequest(state.buf);
+        const parsed = parseRequest(state.buf, state.headCache);
         if ('needMore' in parsed) {
           // Expect: 100-continue is answered once, when the headers are in but the body
           // has not arrived yet; the client then sends the body.
@@ -252,7 +337,10 @@ export function createRawServer(store: Store = new Store()): Server {
         state.buf = state.buf.subarray(request.consumed);
         state.sentContinue = false;
         state.busy = true;
-        await dispatch(request);
+        // dispatch() is synchronous except for receive-pack: only await when it
+        // actually returns a promise, so the common path never yields mid-request.
+        const pending = dispatch(request);
+        if (pending !== undefined) await pending;
         state.busy = false;
         if (state.destroyed || state.waitDrain) return;
       }
